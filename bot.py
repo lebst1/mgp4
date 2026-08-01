@@ -1,552 +1,474 @@
-import asyncio
-import logging
-import sys
+import aiosqlite
 import json
+import logging
 from datetime import datetime
-from typing import Optional
-
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import (
-    BusinessConnection, 
-    BusinessMessagesDeleted,
-    InlineKeyboardMarkup, 
-    InlineKeyboardButton,
-    Message,
-    CallbackQuery
-)
-from aiogram.filters import Command
-from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
-from aiogram.client.default import DefaultBotProperties
-
+from typing import Optional, Tuple, List, Dict, Any
 from config import config
-from database import db
 
-# Настройка логирования
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL),
-    format=config.get_logging_config()['format'],
-    handlers=[
-        logging.FileHandler(config.LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
 logger = logging.getLogger(__name__)
 
-# Инициализация бота с новыми параметрами
-bot = Bot(
-    token=config.BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode='HTML',
-        link_preview_is_disabled=False
-    )
-)
-dp = Dispatcher()
-
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-
-def get_media_data(message: Message) -> tuple[Optional[str], Optional[str]]:
-    """Извлекает информацию о медиа из сообщения"""
-    media_type = None
-    media_data = None
+class Database:
+    """Асинхронный класс для работы с базой данных"""
     
-    if not message.media:
-        return media_type, media_data
+    def __init__(self, db_path: str = None):
+        self.db_path = db_path or config.DB_PATH
     
-    try:
-        if message.photo:
-            media_type = 'photo'
-            media_data = json.dumps({
-                'file_id': message.photo[-1].file_id,
-                'width': message.photo[-1].width,
-                'height': message.photo[-1].height
-            })
-        elif message.document:
-            media_type = 'document'
-            media_data = json.dumps({
-                'file_name': message.document.file_name,
-                'size': message.document.file_size,
-                'mime_type': message.document.mime_type
-            })
-        elif message.video:
-            media_type = 'video'
-            media_data = json.dumps({
-                'duration': message.video.duration,
-                'width': message.video.width,
-                'height': message.video.height
-            })
-        elif message.audio:
-            media_type = 'audio'
-            media_data = json.dumps({
-                'duration': message.audio.duration,
-                'title': message.audio.title,
-                'performer': message.audio.performer
-            })
-        elif message.voice:
-            media_type = 'voice'
-            media_data = json.dumps({
-                'duration': message.voice.duration
-            })
-        elif message.sticker:
-            media_type = 'sticker'
-            media_data = json.dumps({
-                'emoji': message.sticker.emoji,
-                'file_id': message.sticker.file_id
-            })
-        elif message.video_note:
-            media_type = 'video_note'
-            media_data = json.dumps({
-                'duration': message.video_note.duration,
-                'length': message.video_note.length
-            })
-        elif message.animation:
-            media_type = 'animation'
-            media_data = json.dumps({
-                'duration': message.animation.duration,
-                'width': message.animation.width,
-                'height': message.animation.height
-            })
-    except Exception as e:
-        logger.error(f"Ошибка обработки медиа: {e}")
-    
-    return media_type, media_data
-
-async def safe_send_message(chat_id: int, text: str, **kwargs):
-    """Безопасная отправка сообщения с обработкой ошибок"""
-    try:
-        return await bot.send_message(chat_id, text, **kwargs)
-    except TelegramRetryAfter as e:
-        logger.warning(f"Flood wait: {e.retry_after} seconds")
-        await asyncio.sleep(e.retry_after)
-        return await bot.send_message(chat_id, text, **kwargs)
-    except TelegramAPIError as e:
-        logger.error(f"Ошибка отправки сообщения: {e}")
-        return None
-
-# ==================== ОБРАБОТЧИКИ BUSINESS API ====================
-
-@dp.business_connection()
-async def handle_business_connection(connection: BusinessConnection):
-    """Обработка подключения бизнес-аккаунта"""
-    try:
-        user_id = connection.user.id
-        
-        logger.info(f"Business подключение от {user_id}")
-        
-        # Регистрируем пользователя
-        await db.register_user(
-            user_id,
-            connection.user.username,
-            connection.user.first_name,
-            connection.user.last_name,
-            is_premium=True,
-            language_code=getattr(connection.user, 'language_code', 'ru')
-        )
-        
-        # Сохраняем подключение
-        await db.save_connection(
-            connection.connection_id,
-            user_id,
-            f"{connection.user.first_name or ''} {connection.user.last_name or ''}".strip(),
-            connection.can_reply
-        )
-        
-        # Проверяем настройки
-        settings = await db.get_user_settings(user_id)
-        
-        # Приветственное сообщение
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-            [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
-        ])
-        
-        await safe_send_message(
-            user_id,
-            f"🤖 <b>Бот подключен к вашему бизнес-аккаунту!</b>\n\n"
-            f"✅ Я буду сохранять все сообщения из ваших чатов\n"
-            f"✏️ Отслеживать изменения\n"
-            f"🗑️ Сохранять удаленные сообщения\n\n"
-            f"📌 <b>Текущие настройки:</b>\n"
-            f"• Уведомления об удалении: {'✅' if settings and settings[0] else '❌'}\n"
-            f"• Уведомления об изменениях: {'✅' if settings and settings[1] else '❌'}\n"
-            f"• Сохранение медиа: {'✅' if settings and settings[2] else '❌'}\n\n"
-            f"Используйте команды для управления:",
-            reply_markup=kb
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка в handle_business_connection: {e}")
-
-@dp.business_message()
-async def handle_business_message(message: Message):
-    """Обработка новых сообщений"""
-    try:
-        user_id = message.from_user.id if message.from_user else None
-        if not user_id:
-            return
-        
-        # Проверяем, активен ли пользователь
-        user = await db.get_user(user_id)
-        if not user or user[5] == 0:  # is_active
-            return
-        
-        # Получаем информацию о сообщении
-        media_type, media_data = get_media_data(message)
-        
-        message_data = {
-            'message_id': message.message_id,
-            'chat_id': message.chat.id,
-            'chat_title': message.chat.title or f"Chat {message.chat.id}",
-            'chat_type': message.chat.type,
-            'sender_id': message.from_user.id if message.from_user else None,
-            'sender_name': f"{message.from_user.first_name or ''} {message.from_user.last_name or ''}".strip() if message.from_user else '',
-            'text': message.text or message.caption or '',
-            'media_type': media_type,
-            'media_data': media_data,
-            'date': int(message.date.timestamp())
-        }
-        
-        connection_id = getattr(message, 'business_connection_id', None)
-        
-        # Сохраняем сообщение
-        await db.save_message(user_id, message_data, connection_id)
-        
-        logger.info(f"Сохранено сообщение {message.message_id} от {user_id}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка в handle_business_message: {e}")
-
-@dp.edited_business_message()
-async def handle_edited_business_message(message: Message):
-    """Обработка измененных сообщений"""
-    try:
-        user_id = message.from_user.id if message.from_user else None
-        if not user_id:
-            return
-        
-        # Проверяем настройки
-        settings = await db.get_user_settings(user_id)
-        if not settings or settings[1] == 0:  # notify_edited
-            return
-        
-        # Получаем старое сообщение
-        old_data = await db.get_message(user_id, message.message_id, message.chat.id)
-        
-        if old_data:
-            old_text = old_data[0] or ''
-            sender_name = old_data[1] or 'Неизвестно'
-            chat_title = old_data[2] or f"Chat {message.chat.id}"
-            
-            # Сохраняем изменение
-            new_text = message.text or message.caption or ''
-            await db.save_edit(user_id, message.message_id, message.chat.id, old_text, new_text)
-            
-            # Отправляем уведомление
-            text = f"✏️ <b>Сообщение изменено</b>\n"
-            text += f"Чат: {chat_title}\n"
-            text += f"От: {sender_name}\n"
-            text += f"Было: {old_text[:200]}{'...' if len(old_text) > 200 else ''}\n"
-            text += f"Стало: {new_text[:200]}{'...' if len(new_text) > 200 else ''}\n"
-            text += f"ID: {message.message_id}"
-            
-            await safe_send_message(user_id, text)
-            
-    except Exception as e:
-        logger.error(f"Ошибка в handle_edited_business_message: {e}")
-
-@dp.business_messages_deleted()
-async def handle_business_messages_deleted(deleted: BusinessMessagesDeleted):
-    """Обработка удаленных сообщений"""
-    try:
-        # Определяем пользователя
-        user_id = deleted.chat.id
-        
-        # Проверяем настройки
-        settings = await db.get_user_settings(user_id)
-        if not settings or settings[0] == 0:  # notify_deleted
-            return
-        
-        for msg_id in deleted.message_ids:
-            # Получаем информацию о сообщении
-            old_data = await db.get_message(user_id, msg_id, deleted.chat.id)
-            
-            if old_data and old_data[0]:
-                await db.mark_deleted(user_id, msg_id, deleted.chat.id)
+    async def init_database(self):
+        """Инициализация базы данных"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                # Таблица пользователей
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        last_name TEXT,
+                        is_premium INTEGER DEFAULT 0,
+                        is_active INTEGER DEFAULT 1,
+                        connected_at INTEGER,
+                        last_activity INTEGER,
+                        language_code TEXT DEFAULT 'ru'
+                    )
+                ''')
                 
-                text = f"🗑️ <b>Сообщение удалено</b>\n"
-                text += f"Чат: {old_data[2] or deleted.chat.title or deleted.chat.id}\n"
-                text += f"От: {old_data[1] or 'Неизвестно'}\n"
-                text += f"Текст: {old_data[0][:300]}{'...' if len(old_data[0]) > 300 else ''}\n"
-                text += f"ID: {msg_id}"
+                # Таблица сообщений
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id INTEGER,
+                        chat_id INTEGER,
+                        user_id INTEGER,
+                        chat_title TEXT,
+                        chat_type TEXT,
+                        sender_id INTEGER,
+                        sender_name TEXT,
+                        text TEXT,
+                        media_type TEXT,
+                        media_data TEXT,
+                        date INTEGER,
+                        edit_date INTEGER,
+                        delete_date INTEGER,
+                        is_deleted INTEGER DEFAULT 0,
+                        business_connection_id TEXT,
+                        PRIMARY KEY (id, chat_id, user_id)
+                    )
+                ''')
                 
-                await safe_send_message(user_id, text)
+                # Индексы
+                await conn.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_messages_user_chat 
+                    ON messages(user_id, chat_id)
+                ''')
+                await conn.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_messages_deleted 
+                    ON messages(user_id, is_deleted)
+                ''')
+                await conn.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_messages_date 
+                    ON messages(date)
+                ''')
                 
-    except Exception as e:
-        logger.error(f"Ошибка в handle_business_messages_deleted: {e}")
+                # Таблица изменений
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS edits (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        message_id INTEGER,
+                        chat_id INTEGER,
+                        user_id INTEGER,
+                        old_text TEXT,
+                        new_text TEXT,
+                        edit_date INTEGER
+                    )
+                ''')
+                
+                # Таблица подключений
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS connections (
+                        connection_id TEXT PRIMARY KEY,
+                        user_id INTEGER,
+                        user_name TEXT,
+                        is_enabled INTEGER DEFAULT 1,
+                        can_reply INTEGER DEFAULT 0,
+                        created_at INTEGER,
+                        last_active INTEGER,
+                        FOREIGN KEY (user_id) REFERENCES users (user_id)
+                    )
+                ''')
+                
+                # Таблица настроек
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS user_settings (
+                        user_id INTEGER PRIMARY KEY,
+                        notify_deleted INTEGER DEFAULT 1,
+                        notify_edited INTEGER DEFAULT 1,
+                        save_media INTEGER DEFAULT 1,
+                        auto_forward INTEGER DEFAULT 0,
+                        notify_chat_id INTEGER,
+                        FOREIGN KEY (user_id) REFERENCES users (user_id)
+                    )
+                ''')
+                
+                # Таблица статистики
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS stats (
+                        user_id INTEGER,
+                        total_messages INTEGER DEFAULT 0,
+                        deleted_messages INTEGER DEFAULT 0,
+                        edited_messages INTEGER DEFAULT 0,
+                        media_messages INTEGER DEFAULT 0,
+                        last_updated INTEGER,
+                        PRIMARY KEY (user_id),
+                        FOREIGN KEY (user_id) REFERENCES users (user_id)
+                    )
+                ''')
+                
+                # Таблица автоматизации
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS automation_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        rule_name TEXT,
+                        rule_type TEXT,
+                        conditions TEXT,
+                        actions TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at INTEGER,
+                        FOREIGN KEY (user_id) REFERENCES users (user_id)
+                    )
+                ''')
+                
+                await conn.commit()
+                logger.info("База данных инициализирована")
+                
+        except Exception as e:
+            logger.error(f"Ошибка инициализации БД: {e}")
+            raise
+    
+    # ==================== МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ====================
+    
+    async def register_user(self, user_id: int, username: str = None, first_name: str = None, 
+                           last_name: str = None, is_premium: bool = False, language_code: str = 'ru') -> bool:
+        """Регистрация пользователя"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
+                    INSERT OR REPLACE INTO users 
+                    (user_id, username, first_name, last_name, is_premium, is_active, connected_at, last_activity, language_code)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id,
+                    username or '',
+                    first_name or '',
+                    last_name or '',
+                    1 if is_premium else 0,
+                    1,
+                    int(datetime.now().timestamp()),
+                    int(datetime.now().timestamp()),
+                    language_code
+                ))
+                
+                await conn.execute('''
+                    INSERT OR IGNORE INTO user_settings 
+                    (user_id, notify_deleted, notify_edited, save_media, auto_forward)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    user_id,
+                    config.DEFAULT_NOTIFY_DELETED,
+                    config.DEFAULT_NOTIFY_EDITED,
+                    config.DEFAULT_SAVE_MEDIA,
+                    config.DEFAULT_AUTO_FORWARD
+                ))
+                
+                await conn.execute('''
+                    INSERT OR IGNORE INTO stats 
+                    (user_id, total_messages, deleted_messages, edited_messages, media_messages, last_updated)
+                    VALUES (?, 0, 0, 0, 0, ?)
+                ''', (user_id, int(datetime.now().timestamp())))
+                
+                await conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка регистрации пользователя {user_id}: {e}")
+            return False
+    
+    async def get_user(self, user_id: int) -> Optional[Tuple]:
+        """Получить данные пользователя"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute('''
+                    SELECT user_id, username, first_name, last_name, is_premium, is_active, 
+                           connected_at, last_activity, language_code
+                    FROM users WHERE user_id = ?
+                ''', (user_id,))
+                return await cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Ошибка получения пользователя {user_id}: {e}")
+            return None
+    
+    # ==================== МЕТОДЫ ДЛЯ СООБЩЕНИЙ ====================
+    
+    async def save_message(self, user_id: int, message_data: Dict[str, Any], connection_id: str = None) -> bool:
+        """Сохраняет сообщение в БД"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
+                    INSERT OR REPLACE INTO messages 
+                    (id, chat_id, user_id, chat_title, chat_type, sender_id, sender_name, 
+                     text, media_type, media_data, date, edit_date, delete_date, is_deleted, business_connection_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    message_data['message_id'],
+                    message_data['chat_id'],
+                    user_id,
+                    message_data.get('chat_title', ''),
+                    message_data.get('chat_type', 'private'),
+                    message_data.get('sender_id'),
+                    message_data.get('sender_name', ''),
+                    message_data.get('text', ''),
+                    message_data.get('media_type'),
+                    message_data.get('media_data'),
+                    message_data.get('date'),
+                    None,
+                    None,
+                    0,
+                    connection_id
+                ))
+                
+                await conn.execute('''
+                    UPDATE stats SET 
+                        total_messages = total_messages + 1,
+                        media_messages = media_messages + CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END,
+                        last_updated = ?
+                    WHERE user_id = ?
+                ''', (message_data.get('media_type'), int(datetime.now().timestamp()), user_id))
+                
+                await conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения сообщения: {e}")
+            return False
+    
+    async def save_edit(self, user_id: int, message_id: int, chat_id: int, 
+                       old_text: str, new_text: str) -> bool:
+        """Сохраняет изменение сообщения"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
+                    INSERT INTO edits (message_id, chat_id, user_id, old_text, new_text, edit_date)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    message_id,
+                    chat_id,
+                    user_id,
+                    old_text or '',
+                    new_text or '',
+                    int(datetime.now().timestamp())
+                ))
+                
+                await conn.execute('''
+                    UPDATE messages 
+                    SET text = ?, edit_date = ? 
+                    WHERE id = ? AND chat_id = ? AND user_id = ?
+                ''', (
+                    new_text or '',
+                    int(datetime.now().timestamp()),
+                    message_id,
+                    chat_id,
+                    user_id
+                ))
+                
+                await conn.execute('''
+                    UPDATE stats SET 
+                        edited_messages = edited_messages + 1,
+                        last_updated = ?
+                    WHERE user_id = ?
+                ''', (int(datetime.now().timestamp()), user_id))
+                
+                await conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения изменения: {e}")
+            return False
+    
+    async def mark_deleted(self, user_id: int, message_id: int, chat_id: int) -> bool:
+        """Отмечает сообщение как удаленное"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
+                    UPDATE messages 
+                    SET delete_date = ?, is_deleted = 1 
+                    WHERE id = ? AND chat_id = ? AND user_id = ?
+                ''', (
+                    int(datetime.now().timestamp()),
+                    message_id,
+                    chat_id,
+                    user_id
+                ))
+                
+                await conn.execute('''
+                    UPDATE stats SET 
+                        deleted_messages = deleted_messages + 1,
+                        last_updated = ?
+                    WHERE user_id = ?
+                ''', (int(datetime.now().timestamp()), user_id))
+                
+                await conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка отметки удаления: {e}")
+            return False
+    
+    async def get_message(self, user_id: int, message_id: int, chat_id: int) -> Optional[Tuple]:
+        """Получает сообщение из БД"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute('''
+                    SELECT text, sender_name, chat_title, date, edit_date, delete_date, is_deleted
+                    FROM messages 
+                    WHERE id = ? AND chat_id = ? AND user_id = ?
+                ''', (message_id, chat_id, user_id))
+                return await cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Ошибка получения сообщения: {e}")
+            return None
+    
+    async def get_message_edits(self, user_id: int, message_id: int, chat_id: int, limit: int = 5) -> List[Tuple]:
+        """Получает историю изменений сообщения"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute('''
+                    SELECT old_text, new_text, edit_date FROM edits 
+                    WHERE message_id = ? AND chat_id = ? AND user_id = ?
+                    ORDER BY edit_date DESC
+                    LIMIT ?
+                ''', (message_id, chat_id, user_id, limit))
+                return await cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Ошибка получения изменений: {e}")
+            return []
+    
+    # ==================== МЕТОДЫ ДЛЯ НАСТРОЕК ====================
+    
+    async def get_user_settings(self, user_id: int) -> Optional[Tuple]:
+        """Получает настройки пользователя"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute('''
+                    SELECT notify_deleted, notify_edited, save_media, auto_forward, notify_chat_id
+                    FROM user_settings WHERE user_id = ?
+                ''', (user_id,))
+                return await cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Ошибка получения настроек: {e}")
+            return None
+    
+    async def update_user_settings(self, user_id: int, **kwargs) -> bool:
+        """Обновляет настройки пользователя"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                fields = []
+                values = []
+                for key, value in kwargs.items():
+                    if key in ['notify_deleted', 'notify_edited', 'save_media', 'auto_forward', 'notify_chat_id']:
+                        fields.append(f"{key} = ?")
+                        values.append(value)
+                
+                if not fields:
+                    return True
+                
+                values.append(user_id)
+                await conn.execute(f'''
+                    UPDATE user_settings SET {", ".join(fields)}
+                    WHERE user_id = ?
+                ''', values)
+                
+                await conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка обновления настроек: {e}")
+            return False
+    
+    # ==================== МЕТОДЫ ДЛЯ СТАТИСТИКИ ====================
+    
+    async def get_stats(self, user_id: int) -> Optional[Tuple]:
+        """Получает статистику пользователя"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute('''
+                    SELECT total_messages, deleted_messages, edited_messages, media_messages, last_updated
+                    FROM stats WHERE user_id = ?
+                ''', (user_id,))
+                return await cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики: {e}")
+            return None
+    
+    async def get_active_connections_count(self, user_id: int) -> int:
+        """Получает количество активных подключений пользователя"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute('''
+                    SELECT COUNT(*) FROM connections 
+                    WHERE user_id = ? AND is_enabled = 1
+                ''', (user_id,))
+                result = await cursor.fetchone()
+                return result[0] if result else 0
+        except Exception as e:
+            logger.error(f"Ошибка получения подключений: {e}")
+            return 0
+    
+    # ==================== МЕТОДЫ ДЛЯ ПОДКЛЮЧЕНИЙ ====================
+    
+    async def save_connection(self, connection_id: str, user_id: int, user_name: str, can_reply: bool = False) -> bool:
+        """Сохраняет информацию о подключении"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
+                    INSERT OR REPLACE INTO connections 
+                    (connection_id, user_id, user_name, is_enabled, can_reply, created_at, last_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    connection_id,
+                    user_id,
+                    user_name or '',
+                    1,
+                    1 if can_reply else 0,
+                    int(datetime.now().timestamp()),
+                    int(datetime.now().timestamp())
+                ))
+                await conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения подключения: {e}")
+            return False
+    
+    # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
+    
+    async def get_all_users(self) -> List[int]:
+        """Получает список всех пользователей"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute('SELECT user_id FROM users WHERE is_active = 1')
+                return [row[0] for row in await cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Ошибка получения списка пользователей: {e}")
+            return []
+    
+    async def cleanup_deleted_messages(self, days: int = 30) -> int:
+        """Очищает старые удаленные сообщения"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cutoff = int(datetime.now().timestamp()) - (days * 24 * 60 * 60)
+                cursor = await conn.execute('''
+                    DELETE FROM messages 
+                    WHERE is_deleted = 1 AND delete_date < ?
+                ''', (cutoff,))
+                deleted = cursor.rowcount
+                await conn.commit()
+                return deleted
+        except Exception as e:
+            logger.error(f"Ошибка очистки: {e}")
+            return 0
 
-# ==================== КОМАНДЫ ПОЛЬЗОВАТЕЛЕЙ ====================
-
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    """Команда /start"""
-    user_id = message.from_user.id
-    
-    # Регистрируем пользователя
-    await db.register_user(
-        user_id,
-        message.from_user.username,
-        message.from_user.first_name,
-        message.from_user.last_name
-    )
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton(text="❓ Как подключить", callback_data="how_to_connect")]
-    ])
-    
-    await safe_send_message(
-        user_id,
-        "🤖 <b>Business Bot</b>\n\n"
-        "Бот сохраняет все сообщения в ваших чатах!\n\n"
-        "📌 <b>Что умеет:</b>\n"
-        "✅ Сохранять все сообщения (текст, фото, видео, документы)\n"
-        "✏️ Отслеживать изменения сообщений\n"
-        "🗑️ Сохранять удаленные сообщения\n"
-        "📱 Работает через Business API (официально!)\n\n"
-        "🔥 <b>Требуется Telegram Premium</b>\n\n"
-        "Чтобы подключить бота, перейдите в:\n"
-        "Настройки → Telegram Business → Боты",
-        reply_markup=kb
-    )
-
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    """Команда /help"""
-    await safe_send_message(
-        message.from_user.id,
-        "❓ <b>Помощь по Business Bot</b>\n\n"
-        "📌 <b>Основные команды:</b>\n"
-        "/start - главное меню\n"
-        "/stats - статистика\n"
-        "/settings - настройки\n"
-        "/history <id> - история сообщения\n"
-        "/help - помощь\n\n"
-        "🔌 <b>Как подключить:</b>\n"
-        "1. Купите Telegram Premium\n"
-        "2. Перейдите в Настройки → Telegram Business\n"
-        "3. В разделе \"Боты\" добавьте этого бота\n"
-        "4. Дайте доступ к чатам\n\n"
-        "📱 <b>Где посмотреть сохраненные сообщения?</b>\n"
-        "Все сообщения хранятся локально на сервере.\n"
-        "Используйте /history <id> для просмотра истории."
-    )
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    """Команда /stats"""
-    user_id = message.from_user.id
-    
-    stats = await db.get_stats(user_id)
-    active_connections = await db.get_active_connections_count(user_id)
-    
-    if not stats:
-        await safe_send_message(user_id, "📊 Статистика пока пуста")
-        return
-    
-    text = f"📊 <b>Ваша статистика:</b>\n\n"
-    text += f"📩 Всего сообщений: {stats[0]}\n"
-    text += f"🗑️ Удалено: {stats[1]}\n"
-    text += f"✏️ Изменений: {stats[2]}\n"
-    text += f"📎 Медиа: {stats[3]}\n"
-    text += f"🔗 Активных чатов: {active_connections}\n"
-    
-    if stats[4]:
-        last_update = datetime.fromtimestamp(stats[4]).strftime('%Y-%m-%d %H:%M')
-        text += f"📅 Последнее обновление: {last_update}"
-    
-    await safe_send_message(user_id, text)
-
-@dp.message(Command("settings"))
-async def cmd_settings(message: Message):
-    """Команда /settings"""
-    user_id = message.from_user.id
-    settings = await db.get_user_settings(user_id)
-    
-    if not settings:
-        settings = (1, 1, 1, 0, None)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text=f"{'✅' if settings[0] else '❌'} Уведомления об удалении",
-                callback_data="toggle_deleted"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"{'✅' if settings[1] else '❌'} Уведомления об изменениях",
-                callback_data="toggle_edited"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"{'✅' if settings[2] else '❌'} Сохранять медиа",
-                callback_data="toggle_media"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"{'✅' if settings[3] else '❌'} Авто-пересылка",
-                callback_data="toggle_forward"
-            )
-        ]
-    ])
-    
-    await safe_send_message(
-        user_id,
-        "⚙️ <b>Настройки</b>\n\n"
-        "Настройте уведомления под себя:",
-        reply_markup=kb
-    )
-
-@dp.message(Command("history"))
-async def cmd_history(message: Message):
-    """Команда /history <id>"""
-    user_id = message.from_user.id
-    
-    args = message.text.split()
-    if len(args) < 2:
-        await safe_send_message(user_id, "Использование: /history <id_сообщения>")
-        return
-    
-    try:
-        msg_id = int(args[1])
-        
-        # Получаем сообщение
-        msg = await db.get_message(user_id, msg_id, message.chat.id)
-        if not msg:
-            await safe_send_message(user_id, f"❌ Сообщение {msg_id} не найдено")
-            return
-        
-        # Получаем изменения
-        edits = await db.get_message_edits(user_id, msg_id, message.chat.id)
-        
-        text = f"📜 <b>История сообщения</b>\n"
-        text += f"ID: {msg_id}\n"
-        text += f"Чат: {msg[2] or 'Неизвестно'}\n"
-        text += f"От: {msg[1] or 'Неизвестно'}\n"
-        text += f"Текст: {msg[0] or 'Нет текста'}\n"
-        text += f"Дата: {datetime.fromtimestamp(msg[3]).strftime('%Y-%m-%d %H:%M:%S') if msg[3] else 'Неизвестно'}\n"
-        
-        if msg[6] == 1:
-            text += f"❌ Удалено: {datetime.fromtimestamp(msg[5]).strftime('%Y-%m-%d %H:%M:%S') if msg[5] else 'Неизвестно'}\n"
-        
-        if edits:
-            text += f"\n📝 <b>Изменения ({len(edits)}):</b>\n"
-            for i, (old_t, new_t, edit_d) in enumerate(edits[:5], 1):
-                text += f"{i}. {datetime.fromtimestamp(edit_d).strftime('%Y-%m-%d %H:%M:%S')}\n"
-                text += f"   Было: {old_t[:50]}{'...' if len(old_t) > 50 else ''}\n"
-                text += f"   Стало: {new_t[:50]}{'...' if len(new_t) > 50 else ''}\n\n"
-        
-        if len(text) > config.MAX_TEXT_LENGTH:
-            text = text[:config.MAX_TEXT_LENGTH] + "\n\n... (обрезано)"
-        
-        await safe_send_message(user_id, text)
-        
-    except ValueError:
-        await safe_send_message(user_id, "❌ ID должен быть числом")
-    except Exception as e:
-        await safe_send_message(user_id, f"❌ Ошибка: {e}")
-
-# ==================== CALLBACK HANDLERS ====================
-
-@dp.callback_query()
-async def handle_callbacks(callback: CallbackQuery):
-    """Обработка callback-запросов"""
-    user_id = callback.from_user.id
-    
-    if callback.data == "stats":
-        await cmd_stats(callback.message)
-        await callback.answer()
-    
-    elif callback.data == "settings":
-        await cmd_settings(callback.message)
-        await callback.answer()
-    
-    elif callback.data == "how_to_connect":
-        await safe_send_message(
-            user_id,
-            "🔌 <b>Как подключить бота:</b>\n\n"
-            "1️⃣ <b>Купите Telegram Premium</b>\n"
-            "   (Business API доступен только для Premium)\n\n"
-            "2️⃣ <b>Откройте настройки Telegram</b>\n"
-            "   Настройки → Telegram Business\n\n"
-            "3️⃣ <b>Добавьте бота</b>\n"
-            "   В разделе \"Боты\" нажмите \"Добавить бота\"\n"
-            "   Введите имя бота: @ваш_бот\n\n"
-            "4️⃣ <b>Дайте доступ</b>\n"
-            "   Разрешите боту доступ к чатам\n\n"
-            "5️⃣ <b>Готово!</b> 🎉\n"
-            "   Бот начнет сохранять все сообщения"
-        )
-        await callback.answer()
-    
-    elif callback.data.startswith("toggle_"):
-        setting = callback.data.replace("toggle_", "")
-        
-        settings = await db.get_user_settings(user_id)
-        if not settings:
-            settings = [1, 1, 1, 0]
-        
-        setting_map = {
-            "deleted": (0, "notify_deleted"),
-            "edited": (1, "notify_edited"),
-            "media": (2, "save_media"),
-            "forward": (3, "auto_forward")
-        }
-        
-        if setting in setting_map:
-            index, db_field = setting_map[setting]
-            new_value = 0 if settings[index] == 1 else 1
-            
-            await db.update_user_settings(user_id, **{db_field: new_value})
-            
-            await callback.answer("✅ Настройка обновлена!")
-            await cmd_settings(callback.message)
-        
-        await callback.answer()
-    
-    elif callback.data == "help":
-        await cmd_help(callback.message)
-        await callback.answer()
-
-# ==================== ЗАПУСК ====================
-
-async def main():
-    """Запуск бота"""
-    logger.info("🚀 Запуск Business Bot...")
-    
-    # Инициализация БД
-    await db.init_database()
-    
-    bot_info = await bot.get_me()
-    logger.info(f"Бот: @{bot_info.username}")
-    logger.info("")
-    logger.info("📌 Инструкция для пользователей:")
-    logger.info("1. Купить Telegram Premium")
-    logger.info("2. Настройки → Telegram Business → Добавить бота")
-    logger.info("3. Ввести имя бота")
-    logger.info("")
-    logger.info("Бот запущен и ждет подключений!")
-    
-    try:
-        await dp.start_polling(bot)
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
-    except Exception as e:
-        logger.error(f"Ошибка при работе бота: {e}")
-        raise
-
-if __name__ == '__main__':
-    asyncio.run(main())
+# Создаем глобальный объект базы данных
+db = Database()
